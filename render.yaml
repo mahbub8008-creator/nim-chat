@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nim-chat
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NIM_API_KEY
+        sync: false
+      - key: NODE_VERSION
+        value: 20.18.0

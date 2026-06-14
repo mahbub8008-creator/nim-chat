@@ -24,7 +24,8 @@ export function useModels() {
   }, [])
 
   useEffect(() => {
-    fetchModels()
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void fetchModels()
   }, [fetchModels])
 
   const freeModels = models.filter((m) => m.id.toLowerCase().includes("free"))

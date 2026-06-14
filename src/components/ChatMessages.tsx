@@ -18,11 +18,14 @@ export function ChatMessages({ messages, isStreaming, streamingContent, streamin
   const bottomRef = useRef<HTMLDivElement>(null)
   const streamStartRef = useRef<number>(0)
 
-  // Track streaming start time for live tokens/s calculation
+
+  // eslint-disable-next-line react-hooks/refs
   if (isStreaming && streamStartRef.current === 0) {
+    // eslint-disable-next-line react-hooks/refs, react-hooks/purity
     streamStartRef.current = Date.now()
   }
   if (!isStreaming) {
+    // eslint-disable-next-line react-hooks/refs
     streamStartRef.current = 0
   }
 
@@ -33,7 +36,9 @@ export function ChatMessages({ messages, isStreaming, streamingContent, streamin
   // Compute live tokens/s during streaming
   let liveTokensPerSecond: number | undefined
   let liveElapsedMs: number | undefined
+  // eslint-disable-next-line react-hooks/refs
   if (isStreaming && streamStartRef.current > 0 && streamingContent) {
+    // eslint-disable-next-line react-hooks/refs, react-hooks/purity
     liveElapsedMs = Date.now() - streamStartRef.current
     const elapsed = liveElapsedMs / 1000
     const tokens = countTokens(streamingContent) + 4

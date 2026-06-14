@@ -1,0 +1,12 @@
+--- src/hooks/useModels.ts
++++ src/hooks/useModels.ts
+@@ -24,8 +24,7 @@
+   }, [])
+
+   useEffect(() => {
+-    // eslint-disable-next-line react-hooks/exhaustive-deps
+-    fetchModels()
++    void fetchModels()
+   }, [fetchModels])
+
+   const freeModels = models.filter((m) => m.id.toLowerCase().includes("free"))

@@ -52,7 +52,7 @@ export async function POST(req: Request) {
     const stream = await retryWithBackoff(() =>
       client.chat.completions.create({
         model,
-        messages: fullMessages as any,
+        messages: fullMessages as OpenAI.Chat.ChatCompletionMessageParam[],
         stream: true,
         temperature: temperature ?? 0.7,
         max_tokens: max_tokens ?? 4096,
@@ -71,9 +71,9 @@ export async function POST(req: Request) {
             if (!delta) continue
 
             const reasoningContent =
-              (delta as any).reasoning ||
-              (delta as any).reasoning_content ||
-              (delta as any).thinking
+              (delta as Record<string, string>).reasoning ||
+              (delta as Record<string, string>).reasoning_content ||
+              (delta as Record<string, string>).thinking
 
             if (reasoningContent) {
               const data = JSON.stringify({ type: "reasoning", text: reasoningContent })
@@ -108,18 +108,18 @@ export async function POST(req: Request) {
     const message = err instanceof Error ? err.message : "Internal server error"
 
     if (err && typeof err === "object" && "status" in err) {
-      const status = (err as any).status
+      const status = (err as { status?: number }).status
       if (status === 401) {
         return Response.json({ error: "Authentication failed. Check NIM_API_KEY." }, { status: 401 })
       }
       if (status === 404) {
-        const modelName = (err as any).url?.split("/").pop() || "unknown"
+        const modelName = (err as { url?: string }).url?.split("/").pop() || "unknown"
         return Response.json({ error: `Model "${modelName}" not found.` }, { status: 404 })
       }
       if (status === 429) {
         return Response.json({ error: "Rate limited. Please try again." }, { status: 429 })
       }
-      if (status >= 500) {
+      if (status !== undefined && status >= 500) {
         return Response.json({ error: `Server error (${status}). Please try again.` }, { status })
       }
     }

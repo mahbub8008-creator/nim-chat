@@ -93,9 +93,6 @@ export function useChat() {
     }
   }, [state.messages, state.inputTokens, state.outputTokens, state.isStreaming])
 
-  const update = useCallback((partial: Partial<ChatState>) => {
-    setState((prev) => ({ ...prev, ...partial }))
-  }, [])
 
   // Shared streaming logic — called by both sendMessage and editAndResend
   const streamResponse = useCallback(

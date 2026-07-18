@@ -35,12 +35,36 @@ interface ChatState {
   searchContext: { query: string; sources: string[] } | null
 }
 
-const SEARCH_RE = /^\[SEARCH:\s*(.+?)\s*\]/
+/** Used by both the initial loader and the migration effect below. */
+const OLD_DEFAULT_PROMPT =
+  "You are a helpful, knowledgeable assistant. Be concise but thorough."
+
+/** Default system prompt shipped to fresh users, and migrated onto for users still on the old default. */
+const NEW_DEFAULT_PROMPT = `You are a helpful, knowledgeable assistant. You have access to a web search tool to find current info, news, or verify facts.
+
+To search the web, output exactly this marker on its own line:
+[SEARCH: your query here]
+
+RULES:
+- USE SEARCH for recent events, facts past your training data, or when the user says "latest", "today", or "current".
+- DO NOT USE SEARCH for casual chat, coding tasks, opinions, or general knowledge you already possess.
+- FORMAT STRICTLY: Do not put brackets inside your query.
+- DO NOT use the search marker as an example or casually in text.
+
+EXAMPLES:
+User: Who won the 2024 Super Bowl?
+Assistant: [SEARCH: 2024 Super Bowl winner]
+
+User: Explain how gravity works.
+Assistant: Gravity is a fundamental interaction...`
+
+// Unanchored + bracket-safe: catches markers mid-stream and won't swallow closing ].
+const SEARCH_RE = /\[SEARCH:\s*([^\]]+?)\s*\]/
 
 export function useChat() {
   const [settings, setSettings] = useLocalStorage<ChatSettings>(SETTINGS_KEY, {
     model: "mistralai/mistral-large-3-675b-instruct-2512",
-    systemPrompt: "You are a helpful, knowledgeable assistant. Be concise but thorough.",
+    systemPrompt: NEW_DEFAULT_PROMPT,
     reasoningEffort: null,
     temperature: DEFAULT_TEMPERATURE,
     maxTokens: DEFAULT_MAX_TOKENS,
@@ -98,6 +122,18 @@ export function useChat() {
       } catch { /* quota exceeded */ }
     }
   }, [state.messages, state.inputTokens, state.outputTokens, state.isStreaming, state.isSearching])
+
+  // Surgical migration: users still on the pre-search-launch default prompt get
+  // upgraded to the new search-instructed default, while users who already
+  // customized their prompt are left alone. Preserves model, reasoningEffort,
+  // temperature, maxTokens, topP — only the systemPrompt text is updated.
+  // Calls setSettings directly (declared above) so we don't forward-reference
+  // `setSystemPrompt` which is defined later in this function.
+  useEffect(() => {
+    if (settings.systemPrompt === OLD_DEFAULT_PROMPT) {
+      setSettings((prev) => ({ ...prev, systemPrompt: NEW_DEFAULT_PROMPT }))
+    }
+  }, [settings.systemPrompt, setSettings])
 
   const update = useCallback((partial: Partial<ChatState>) => {
     setState((prev) => ({ ...prev, ...partial }))

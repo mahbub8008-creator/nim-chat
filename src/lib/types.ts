@@ -52,3 +52,18 @@ export interface ModelInfo {
   owned_by: string
   supports_vision: boolean
 }
+
+export interface SearchResult {
+  title: string
+  href: string
+  body: string
+}
+
+export interface SearchResponse {
+  results: SearchResult[]
+}
+
+export interface ExtractResponse {
+  url: string
+  content: string
+}

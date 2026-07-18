@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useRef, useCallback, useEffect } from "react"
-import type { ChatMessage, ContentPart, StreamChunk } from "@/lib/types"
+import type { ChatMessage, ContentPart, StreamChunk, SearchResult } from "@/lib/types"
 import { countTokens, getContentText } from "@/lib/tokens"
 import { parseStream } from "@/lib/stream"
 import { useLocalStorage } from "./useLocalStorage"
@@ -31,7 +31,11 @@ interface ChatState {
   streamingReasoning: string
   hasShownReasoning: boolean
   error: string | null
+  isSearching: boolean
+  searchContext: { query: string; sources: string[] } | null
 }
+
+const SEARCH_RE = /^\[SEARCH:\s*(.+?)\s*\]/
 
 export function useChat() {
   const [settings, setSettings] = useLocalStorage<ChatSettings>(SETTINGS_KEY, {
@@ -44,7 +48,6 @@ export function useChat() {
   })
 
   const [state, setState] = useState<ChatState>(() => {
-    // Load saved conversation from localStorage on initial mount
     try {
       if (typeof window !== "undefined") {
         const saved = window.localStorage.getItem(CONVERSATION_KEY)
@@ -60,6 +63,8 @@ export function useChat() {
               streamingReasoning: "",
               hasShownReasoning: false,
               error: null,
+              isSearching: false,
+              searchContext: null,
             }
           }
         }
@@ -74,15 +79,16 @@ export function useChat() {
       streamingReasoning: "",
       hasShownReasoning: false,
       error: null,
+      isSearching: false,
+      searchContext: null,
     }
   })
 
   const abortRef = useRef<AbortController | null>(null)
   const streamStartRef = useRef<number>(0)
 
-  // Auto-save conversation to localStorage whenever messages/tokens change
   useEffect(() => {
-    if (state.messages.length > 0 && !state.isStreaming) {
+    if (state.messages.length > 0 && !state.isStreaming && !state.isSearching) {
       try {
         window.localStorage.setItem(CONVERSATION_KEY, JSON.stringify({
           messages: state.messages,
@@ -91,13 +97,12 @@ export function useChat() {
         }))
       } catch { /* quota exceeded */ }
     }
-  }, [state.messages, state.inputTokens, state.outputTokens, state.isStreaming])
+  }, [state.messages, state.inputTokens, state.outputTokens, state.isStreaming, state.isSearching])
 
   const update = useCallback((partial: Partial<ChatState>) => {
     setState((prev) => ({ ...prev, ...partial }))
   }, [])
 
-  // Shared streaming logic — called by both sendMessage and editAndResend
   const streamResponse = useCallback(
     async (conversationMessages: { role: string; content: string | ContentPart[] }[]) => {
       const controller = new AbortController()
@@ -146,6 +151,25 @@ export function useChat() {
           () => {
             setState((prev) => {
               const fullContent = prev.streamingContent
+              const match = fullContent.match(SEARCH_RE)
+
+              if (match) {
+                // AI requested a web search — don't add marker as message.
+                // Keep abortRef.current alive so cancelStream() also aborts the search fetches.
+                const query = match[1]
+                // Trigger search cycle asynchronously
+                setTimeout(() => searchAndRequery(conversationMessages, query), 0)
+                return {
+                  ...prev,
+                  isSearching: true,
+                  searchContext: { query, sources: [] },
+                  isStreaming: false,
+                  streamingContent: "",
+                  streamingReasoning: "",
+                  hasShownReasoning: false,
+                }
+              }
+
               const outputTok = countTokens(fullContent) + 4
               const elapsed = (Date.now() - streamStartRef.current) / 1000
               const generationTimeMs = Date.now() - streamStartRef.current
@@ -219,11 +243,120 @@ export function useChat() {
     [settings]
   )
 
+  const searchAndRequery = useCallback(
+    async (originalMessages: { role: string; content: string | ContentPart[] }[], query: string) => {
+      // Reuse the stream's AbortController so cancelStream() also cancels these fetches.
+      const signal = abortRef.current?.signal
+      try {
+        const searchRes = await fetch("/api/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, max_results: 5 }),
+          ...(signal ? { signal } : {}),
+        })
+        if (!searchRes.ok) {
+          throw new Error("Search failed")
+        }
+        const searchData = await searchRes.json()
+        const results: SearchResult[] = searchData.results || []
+
+        // Extract first 2 URLs
+        const urls = results.slice(0, 2).map((r) => r.href).filter(Boolean)
+        const parts: string[] = []
+
+        for (const url of urls) {
+          try {
+            const extRes = await fetch("/api/extract", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url }),
+              ...(signal ? { signal } : {}),
+            })
+            if (extRes.ok) {
+              const extData = await extRes.json()
+              if (extData.content) {
+                parts.push(`Source: ${url}\n${extData.content}`)
+                // Accumulate sources via prev state to fix the closure bug.
+                setState((prev) => ({
+                  ...prev,
+                  searchContext: {
+                    query,
+                    sources: [...(prev.searchContext?.sources || []), url],
+                  },
+                }))
+              }
+            }
+          } catch (e) {
+            // Rethrow aborts so the outer catch can handle them silently.
+            if ((e as Error).name === "AbortError") throw e
+          }
+        }
+
+        const searchContext = parts.length > 0 ? parts.join("\n\n---\n\n") : null
+
+        // Build new conversation messages: pop last user message, re-add with separate context injection.
+        const popMsg = originalMessages.pop()
+
+        const newMessages = [
+          ...originalMessages,
+          ...(searchContext
+            ? [{ role: "user" as const, content: `[WEB SEARCH RESULT]\n${searchContext}` }]
+            : []),
+          ...(popMsg ? [popMsg] : []),
+        ]
+
+        // Honor an abort that landed in the microsecond window between search completion
+        // and streamResponse init (otherwise streamResponse would replace abortRef and the
+        // user's cancel intent would be lost).
+        if (signal?.aborted) {
+          const e = new Error("aborted")
+          ;(e as Error).name = "AbortError"
+          throw e
+        }
+
+        streamStartRef.current = Date.now()
+        setState((prev) => ({
+          ...prev,
+          isStreaming: true,
+          streamingContent: "",
+          streamingReasoning: "",
+          hasShownReasoning: false,
+          isSearching: false,
+        }))
+
+        await streamResponse(newMessages)
+      } catch (err) {
+        if ((err as Error)?.name === "AbortError") {
+          // Silent cancel: user pressed Stop mid-search. Don't show error banner.
+          setState((prev) => ({
+            ...prev,
+            isSearching: false,
+            searchContext: null,
+            streamingContent: "",
+            streamingReasoning: "",
+          }))
+          return
+        }
+        setState((prev) => ({
+          ...prev,
+          isSearching: false,
+          searchContext: null,
+          error: err instanceof Error ? err.message : "Search & re-query failed",
+        }))
+      } finally {
+        // If this controller was aborted, clear the ref so future requests start clean.
+        if (abortRef.current?.signal.aborted) {
+          abortRef.current = null
+        }
+      }
+    },
+    [streamResponse]
+  )
+
   const sendMessage = useCallback(
     async (text: string, images?: string[]) => {
       const hasImages = !!(images && images.length > 0)
 
-      // Build content for the message
       let content: string | ContentPart[]
       if (hasImages) {
         const parts: ContentPart[] = []
@@ -253,6 +386,8 @@ export function useChat() {
         streamingReasoning: "",
         hasShownReasoning: false,
         error: null,
+        isSearching: false,
+        searchContext: null,
       }))
 
       const conversationMessages = [...state.messages, userMessage].map((m) => ({
@@ -269,10 +404,8 @@ export function useChat() {
     async (index: number, newContent: string) => {
       if (!newContent.trim() || state.isStreaming) return
 
-      // Truncate messages to before the edited message
       const truncatedMessages = state.messages.slice(0, index)
 
-      // Recalculate token counts from scratch for the truncated conversation
       let newInputTokens = 0
       let newOutputTokens = 0
       for (const msg of truncatedMessages) {
@@ -298,6 +431,8 @@ export function useChat() {
         streamingReasoning: "",
         hasShownReasoning: false,
         error: null,
+        isSearching: false,
+        searchContext: null,
       }))
 
       const conversationMessages = [...truncatedMessages, userMessage].map((m) => ({
@@ -328,6 +463,8 @@ export function useChat() {
       streamingReasoning: "",
       hasShownReasoning: false,
       error: null,
+      isSearching: false,
+      searchContext: null,
     })
   }, [])
 

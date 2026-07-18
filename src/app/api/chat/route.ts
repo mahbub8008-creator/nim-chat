@@ -1,5 +1,7 @@
 import OpenAI from "openai"
+import { retryWithBackoff } from "@/lib/retry"
 
+// Preserve historical chat-route retry count (was 3 in the inline helper it replaced).
 const MAX_RETRIES = 3
 
 function getClient() {
@@ -11,21 +13,6 @@ function getClient() {
   })
 }
 
-function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries = MAX_RETRIES): Promise<T> {
-  let lastError: unknown
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return fn()
-    } catch (err: unknown) {
-      lastError = err
-      if (attempt < maxRetries) {
-        continue
-      }
-    }
-  }
-  throw lastError
-}
-
 export async function POST(req: Request) {
   try {
     const { model, messages, system_prompt, reasoning_effort, temperature, max_tokens, top_p } = await req.json()
@@ -34,9 +21,12 @@ export async function POST(req: Request) {
       return Response.json({ error: "model and messages are required" }, { status: 400 })
     }
 
+    const today = new Date().toLocaleDateString("en-US", {
+      weekday: "long", year: "numeric", month: "long", day: "numeric",
+    })
     const fullMessages: { role: string; content: string | { type: string; text?: string; image_url?: { url: string } }[] }[] = []
     if (system_prompt) {
-      fullMessages.push({ role: "system", content: system_prompt })
+      fullMessages.push({ role: "system", content: `Today's date is ${today}.\n\n${system_prompt}` })
     }
 
     // Map messages — if content is already an array (multimodal), pass it through
@@ -49,16 +39,18 @@ export async function POST(req: Request) {
 
     const client = getClient()
 
-    const stream = await retryWithBackoff(() =>
-      client.chat.completions.create({
-        model,
-        messages: fullMessages as any,
-        stream: true,
-        temperature: temperature ?? 0.7,
-        max_tokens: max_tokens ?? 4096,
-        top_p: top_p ?? 1,
-        ...(reasoning_effort ? { reasoning_effort } : {}),
-      })
+    const stream = await retryWithBackoff(
+      () =>
+        client.chat.completions.create({
+          model,
+          messages: fullMessages as any,
+          stream: true,
+          temperature: temperature ?? 0.7,
+          max_tokens: max_tokens ?? 4096,
+          top_p: top_p ?? 1,
+          ...(reasoning_effort ? { reasoning_effort } : {}),
+        }),
+      MAX_RETRIES
     )
 
     const encoder = new TextEncoder()

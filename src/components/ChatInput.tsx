@@ -286,7 +286,7 @@ export function ChatInput({ onSend, onCancel, isStreaming, disabled, supportsVis
         ) : (
           <button
             onClick={handleSubmit}
-            disabled={(!input.trim() && images.length === 0) || disabled}
+            disabled={(!input.trim() && images.length === 0) || disabled || isStreaming}
             className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>

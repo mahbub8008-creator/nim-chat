@@ -33,6 +33,8 @@ export function ChatContainer() {
     setTemperature,
     setMaxTokens,
     setTopP,
+    isSearching,
+    searchContext,
   } = useChat()
 
   const { models, paidModels, freeModels, loading: modelsLoading, refetch: refetchModels } = useModels()
@@ -156,6 +158,19 @@ export function ChatContainer() {
         onEditMessage={editAndResend}
       />
 
+      {/* Search indicator */}
+      {isSearching && (
+        <div className="flex items-center gap-2 border-t border-zinc-800 bg-zinc-900/80 px-4 py-2">
+          <span className="inline-block h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+          <span className="text-sm text-zinc-400">
+            Searching web{searchContext?.sources && searchContext.sources.length > 0
+              ? ` — extracted ${searchContext.sources.length} page(s)`
+              : ""}
+            ...
+          </span>
+        </div>
+      )}
+
       {/* Token bar */}
       <TokenBar inputTokens={inputTokens} outputTokens={outputTokens} />
 
@@ -163,7 +178,7 @@ export function ChatContainer() {
       <ChatInput
         onSend={sendMessage}
         onCancel={cancelStream}
-        isStreaming={isStreaming}
+        isStreaming={isStreaming || isSearching}
         supportsVision={models.find((m) => m.id === settings.model)?.supports_vision ?? false}
       />
 

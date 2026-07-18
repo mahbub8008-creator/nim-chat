@@ -260,28 +260,28 @@ export function useChat() {
         const searchData = await searchRes.json()
         const results: SearchResult[] = searchData.results || []
 
-        // Extract first 2 URLs
-        const urls = results.slice(0, 2).map((r) => r.href).filter(Boolean)
+        // Extract only the BEST-matching URL (DDG's top-ranked result).
+        const bestUrl = results[0]?.href
         const parts: string[] = []
 
-        for (const url of urls) {
+        if (bestUrl) {
           try {
             const extRes = await fetch("/api/extract", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ url }),
+              body: JSON.stringify({ url: bestUrl }),
               ...(signal ? { signal } : {}),
             })
             if (extRes.ok) {
               const extData = await extRes.json()
               if (extData.content) {
-                parts.push(`Source: ${url}\n${extData.content}`)
+                parts.push(`Source: ${bestUrl}\n${extData.content}`)
                 // Accumulate sources via prev state to fix the closure bug.
                 setState((prev) => ({
                   ...prev,
                   searchContext: {
                     query,
-                    sources: [...(prev.searchContext?.sources || []), url],
+                    sources: [...(prev.searchContext?.sources || []), bestUrl],
                   },
                 }))
               }

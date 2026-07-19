@@ -179,7 +179,6 @@ export function ChatContainer() {
         onSend={sendMessage}
         onCancel={cancelStream}
         isStreaming={isStreaming || isSearching}
-        supportsVision={models.find((m) => m.id === settings.model)?.supports_vision ?? false}
       />
 
       {/* Mobile drawer */}

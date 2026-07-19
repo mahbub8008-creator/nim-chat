@@ -232,27 +232,25 @@ export function ChatInput({ onSend, onCancel, isStreaming, disabled, supportsVis
 
       {/* Input row */}
       <div className="flex items-end gap-2 p-3 md:p-4">
-        {/* Image upload button - only shown for vision-capable models */}
-        {supportsVision && (
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isStreaming || disabled || images.length >= MAX_IMAGES}
-            className="flex-shrink-0 rounded-lg p-2.5 text-zinc-500 hover:text-emerald-400 hover:bg-zinc-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-            title="Upload image"
-          >
-            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.41a2.25 2.25 0 013.182 0l2.909 2.91m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
-            </svg>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept={ACCEPTED_TYPES.join(",")}
-              multiple
-              className="hidden"
-              onChange={handleImageSelect}
-            />
-          </button>
-        )}
+        {/* Image upload button - always visible; submit-time validation handles non-vision models */}
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          disabled={isStreaming || disabled || images.length >= MAX_IMAGES || !supportsVision}
+          className="flex-shrink-0 rounded-lg p-2.5 text-zinc-500 hover:text-emerald-400 hover:bg-zinc-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+          title={supportsVision ? "Upload image" : "Upload image — current model does not accept images"}
+        >
+          <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.41a2.25 2.25 0 013.182 0l2.909 2.91m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
+          </svg>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={ACCEPTED_TYPES.join(",")}
+            multiple
+            className="hidden"
+            onChange={handleImageSelect}
+          />
+        </button>
 
         {/* Text area */}
         <div className="flex-1 relative">

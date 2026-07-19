@@ -1,14 +1,54 @@
 import OpenAI from "openai"
 import { retryWithBackoff } from "@/lib/retry"
+import type { ChatMessage as LocalChatMessage, ToolCall } from "@/lib/types"
+
+/** Shape of streamed delta chunks across NIM implementations. */
+interface StreamDelta {
+  reasoning?: string
+  reasoning_content?: string
+  thinking?: string
+  content?: string
+  tool_calls?: Array<{
+    index?: number
+    id?: string
+    type?: string
+    function?: { name?: string; arguments?: string }
+  }>
+}
 
 // Preserve historical chat-route retry count (was 3 in the inline helper it replaced).
 const MAX_RETRIES = 3
+
+/** Tool the model can opt into for up-to-date lookups. Implementation lives on the client. */
+const WEB_SEARCH_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "web_search",
+    description:
+      "Search the web and return excerpts from relevant pages. Use this when you need current information, recent events, or facts past your training data — for example when the user asks about today's news, latest scores, recent releases, prices, or anything that may have changed. Always cite the URLs of the pages you read.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "A concise search query (5-12 words). Use the user's domain-specific terms; mirror named entities, dates, or product names exactly.",
+        },
+      },
+      required: ["query"],
+    },
+  },
+}
+
+const TOOLS = [WEB_SEARCH_TOOL]
 
 function getClient() {
   return new OpenAI({
     apiKey: process.env.NIM_API_KEY || "",
     baseURL: "https://integrate.api.nvidia.com/v1",
-    timeout: 60_000,
+    // Tool-calling lets the model think longer before deciding whether to call web_search.
+    // 180s gives enough headroom before we surface a 504 — cancellation is the real signal we care about.
+    timeout: 180_000,
     maxRetries: 0,
   })
 }
@@ -24,18 +64,10 @@ export async function POST(req: Request) {
     const today = new Date().toLocaleDateString("en-US", {
       weekday: "long", year: "numeric", month: "long", day: "numeric",
     })
-    const fullMessages: { role: string; content: string | { type: string; text?: string; image_url?: { url: string } }[] }[] = []
-    if (system_prompt) {
-      fullMessages.push({ role: "system", content: `Today's date is ${today}.\n\n${system_prompt}` })
-    }
-
-    // Map messages — if content is already an array (multimodal), pass it through
-    for (const msg of messages) {
-      fullMessages.push({
-        role: msg.role,
-        content: msg.content,
-      })
-    }
+    // The SDK's union type for "messages" includes user content as string-or-ContentPart[],
+    // assistant-with-tool_calls content as null-or-string, and tool messages with tool_call_id.
+    // We type fullMessages precisely per role branch to satisfy those constraints.
+    const fullMessages = buildFullMessages(messages as LocalChatMessage[], system_prompt, today)
 
     const client = getClient()
 
@@ -43,8 +75,9 @@ export async function POST(req: Request) {
       () =>
         client.chat.completions.create({
           model,
-          messages: fullMessages as any,
+          messages: fullMessages,
           stream: true,
+          tools: TOOLS,
           temperature: temperature ?? 0.7,
           max_tokens: max_tokens ?? 4096,
           top_p: top_p ?? 1,
@@ -58,27 +91,71 @@ export async function POST(req: Request) {
     const readable = new ReadableStream({
       async start(controller) {
         try {
+          // Accumulator for streamed tool_calls. OpenAI emits multiple deltas per
+          // tool call indexed by `index`; only the FIRST delta carries id+name,
+          // and later deltas only carry partial `arguments`. We assemble each
+          // tool call across chunks and emit a single `tool_calls_required`
+          // chunk when the model finishes a turn with finish_reason='tool_calls'.
+          const toolCallsMap = new Map<number, ToolCall>()
+          let finishReason: string | null = null
+
           for await (const chunk of stream) {
-            const delta = chunk.choices?.[0]?.delta
-            if (!delta) continue
+            const choice = chunk.choices?.[0]
+            const delta = choice?.delta as StreamDelta | undefined
 
-            const reasoningContent =
-              (delta as any).reasoning ||
-              (delta as any).reasoning_content ||
-              (delta as any).thinking
-
-            if (reasoningContent) {
-              const data = JSON.stringify({ type: "reasoning", text: reasoningContent })
-              controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+            if (delta?.reasoning || delta?.reasoning_content || delta?.thinking) {
+              const text = delta.reasoning || delta.reasoning_content || delta.thinking
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "reasoning", text })}\n\n`))
             }
 
-            if (delta.content) {
-              const data = JSON.stringify({ type: "content", text: delta.content })
-              controller.enqueue(encoder.encode(`data: ${data}\n\n`))
+            if (delta?.content) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "content", text: delta.content })}\n\n`))
+            }
+
+            if (Array.isArray(delta?.tool_calls)) {
+              for (const tcDelta of delta.tool_calls) {
+                // NIM always supplies `index`. If missing, drop the delta rather than collapsing
+                // parallel tool calls onto slot 0.
+                if (typeof tcDelta.index !== "number") continue
+                const existing = toolCallsMap.get(tcDelta.index)
+                if (!existing) {
+                  toolCallsMap.set(tcDelta.index, {
+                    id: tcDelta.id ?? "",
+                    type: "function",
+                    function: {
+                      name: tcDelta.function?.name ?? "",
+                      arguments: tcDelta.function?.arguments ?? "",
+                    },
+                  })
+                } else {
+                  if (tcDelta.id) existing.id = tcDelta.id
+                  if (tcDelta.function?.name) existing.function.name = tcDelta.function.name
+                  if (tcDelta.function?.arguments) {
+                    existing.function.arguments += tcDelta.function.arguments
+                  }
+                }
+              }
+            }
+
+            if (choice?.finish_reason) {
+              finishReason = choice.finish_reason
             }
           }
 
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done", text: "" })}\n\n`))
+          if (finishReason === "tool_calls" && toolCallsMap.size > 0) {
+            const tool_calls = Array.from(toolCallsMap.values()).filter(
+              (tc) => tc.id && tc.function.name
+            )
+            const dropped = toolCallsMap.size - tool_calls.length
+            if (dropped > 0) {
+              console.warn(`[chat] dropped ${dropped} malformed tool_call delta(s) (missing id or function name)`)
+            }
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ type: "tool_calls_required", tool_calls })}\n\n`)
+            )
+          } else {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done", text: "" })}\n\n`))
+          }
           controller.close()
         } catch (err) {
           const message = err instanceof Error ? err.message : "Stream error"
@@ -100,12 +177,12 @@ export async function POST(req: Request) {
     const message = err instanceof Error ? err.message : "Internal server error"
 
     if (err && typeof err === "object" && "status" in err) {
-      const status = (err as any).status
+      const status = (err as { status?: number }).status ?? 0
       if (status === 401) {
         return Response.json({ error: "Authentication failed. Check NIM_API_KEY." }, { status: 401 })
       }
       if (status === 404) {
-        const modelName = (err as any).url?.split("/").pop() || "unknown"
+        const modelName = (err as { url?: string }).url?.split("/").pop() || "unknown"
         return Response.json({ error: `Model "${modelName}" not found.` }, { status: 404 })
       }
       if (status === 429) {
@@ -118,4 +195,69 @@ export async function POST(req: Request) {
 
     return Response.json({ error: message }, { status: 500 })
   }
+}
+
+/**
+ * Project the client's ChatMessage-shaped messages into the OpenAI message-param
+ * union the NIM SDK expects. Preserves tool_calls (assistant) and tool_call_id (tool),
+ * and passes ContentPart[] user content unchanged so image uploads survive the round trip.
+ */
+function buildFullMessages(
+  messages: LocalChatMessage[],
+  systemPrompt: string | undefined,
+  today: string
+): OpenAI.Chat.ChatCompletionMessageParam[] {
+  const fullMessages: OpenAI.Chat.ChatCompletionMessageParam[] = []
+  if (systemPrompt) {
+    fullMessages.push({ role: "system", content: `Today's date is ${today}.\n\n${systemPrompt}` })
+  }
+
+  for (const msg of messages) {
+    switch (msg.role) {
+      case "tool":
+        fullMessages.push({
+          role: "tool",
+          tool_call_id: msg.tool_call_id ?? "",
+          content: typeof msg.content === "string" ? msg.content : "",
+        })
+        break
+
+      case "user":
+        // User content may be plain text or ContentPart[] (images); pass through unchanged.
+        fullMessages.push({
+          role: "user",
+          content: msg.content as OpenAI.Chat.ChatCompletionContentPart[] | string,
+        })
+        break
+
+      case "assistant": {
+        const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0
+        if (hasToolCalls) {
+          // OpenAI strictly expects null content when the assistant message only carries tool_calls.
+          const content =
+            typeof msg.content === "string" && msg.content.length > 0 ? msg.content : null
+          fullMessages.push({
+            role: "assistant",
+            content,
+            tool_calls: msg.tool_calls as OpenAI.Chat.ChatCompletionMessageToolCall[],
+          })
+        } else {
+          fullMessages.push({
+            role: "assistant",
+            content: typeof msg.content === "string" ? msg.content : "",
+          })
+        }
+        break
+      }
+
+      case "system":
+        fullMessages.push({
+          role: "system",
+          content: typeof msg.content === "string" ? msg.content : "",
+        })
+        break
+    }
+  }
+
+  return fullMessages
 }

@@ -2,19 +2,33 @@ export type ContentPart =
   | { type: "text"; text: string }
   | { type: "image_url"; image_url: { url: string; detail?: "auto" | "low" | "high" } }
 
+export interface ToolCall {
+  id: string
+  type: "function"
+  function: {
+    name: string
+    arguments: string
+  }
+}
+
 export interface ChatMessage {
-  role: "user" | "assistant" | "system"
+  role: "user" | "assistant" | "system" | "tool"
   content: string | ContentPart[]
   reasoning?: string
   timestamp?: number
   tokensPerSecond?: number
   generationTimeMs?: number
+  /** Assistant messages: tool calls the model emitted. */
+  tool_calls?: ToolCall[]
+  /** Tool messages: id of the tool_call this is responding to. */
+  tool_call_id?: string
+  /** Final assistant message: URLs the AI consulted during a web search turn. */
+  sources?: string[]
 }
 
-export interface StreamChunk {
-  type: "reasoning" | "content" | "done" | "error"
-  text: string
-}
+export type StreamChunk =
+  | { type: "reasoning" | "content" | "done" | "error"; text: string }
+  | { type: "tool_calls_required"; tool_calls: ToolCall[] }
 
 export interface ModelParams {
   temperature: number

@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useRef, useCallback, useEffect } from "react"
-import type { ChatMessage, ContentPart, StreamChunk, SearchResult } from "@/lib/types"
+import type { ChatMessage, ContentPart, StreamChunk, SearchResult, ToolCall } from "@/lib/types"
 import { countTokens, getContentText } from "@/lib/tokens"
 import { parseStream } from "@/lib/stream"
 import { useLocalStorage } from "./useLocalStorage"
@@ -33,14 +33,17 @@ interface ChatState {
   error: string | null
   isSearching: boolean
   searchContext: { query: string; sources: string[] } | null
+  /** Set when tool_calls_required committed an interim assistant message early;
+   *  parseStream's onDone must then skip appending to messages. */
+  didCommitInterim: boolean
 }
 
-/** Used by both the initial loader and the migration effect below. */
-const OLD_DEFAULT_PROMPT =
+// ----- Legacy prompts we want to migrate users off of -----
+/** First-ever default shipped before web search existed. */
+const LEGACY_DEFAULT_PROMPT =
   "You are a helpful, knowledgeable assistant. Be concise but thorough."
-
-/** Default system prompt shipped to fresh users, and migrated onto for users still on the old default. */
-const NEW_DEFAULT_PROMPT = `You are a helpful, knowledgeable assistant. You have access to a web search tool to find current info, news, or verify facts.
+/** Second default: relied on a [SEARCH: ...] text marker. Replaced by tool calling. */
+const LEGACY_MARKER_PROMPT = `You are a helpful, knowledgeable assistant. You have access to a web search tool to find current info, news, or verify facts.
 
 To search the web, output exactly this marker on its own line:
 [SEARCH: your query here]
@@ -58,13 +61,24 @@ Assistant: [SEARCH: 2024 Super Bowl winner]
 User: Explain how gravity works.
 Assistant: Gravity is a fundamental interaction...`
 
-// Unanchored + bracket-safe: catches markers mid-stream and won't swallow closing ].
-const SEARCH_RE = /\[SEARCH:\s*([^\]]+?)\s*\]/
+// ----- Current default: native tool calling -----
+const DEFAULT_PROMPT = `You are a helpful, knowledgeable assistant. You have access to a \`web_search\` function that fetches current information from the web and returns page excerpts. Use it whenever the user might benefit from up-to-date data and your training-cutoff knowledge would be unreliable or stale.
+
+USE \`web_search\` for:
+- Recent events, news, sports scores, product releases, prices, or anything time-sensitive.
+- Fact-checking specific numbers, names, dates, or claims the user asks about.
+- Anything that may have changed since your training cutoff.
+
+DO NOT use \`web_search\` for:
+- Casual chat, opinions, creative writing, math, coding help, or general well-known concepts.
+- Anything you are already confident about.
+
+When you use \`web_search\`, cite the URLs you read so the user can verify your answer.`
 
 export function useChat() {
   const [settings, setSettings] = useLocalStorage<ChatSettings>(SETTINGS_KEY, {
     model: "mistralai/mistral-large-3-675b-instruct-2512",
-    systemPrompt: NEW_DEFAULT_PROMPT,
+    systemPrompt: DEFAULT_PROMPT,
     reasoningEffort: null,
     temperature: DEFAULT_TEMPERATURE,
     maxTokens: DEFAULT_MAX_TOKENS,
@@ -89,6 +103,7 @@ export function useChat() {
               error: null,
               isSearching: false,
               searchContext: null,
+              didCommitInterim: false,
             }
           }
         }
@@ -105,6 +120,7 @@ export function useChat() {
       error: null,
       isSearching: false,
       searchContext: null,
+      didCommitInterim: false,
     }
   })
 
@@ -123,15 +139,12 @@ export function useChat() {
     }
   }, [state.messages, state.inputTokens, state.outputTokens, state.isStreaming, state.isSearching])
 
-  // Surgical migration: users still on the pre-search-launch default prompt get
-  // upgraded to the new search-instructed default, while users who already
-  // customized their prompt are left alone. Preserves model, reasoningEffort,
-  // temperature, maxTokens, topP — only the systemPrompt text is updated.
-  // Calls setSettings directly (declared above) so we don't forward-reference
-  // `setSystemPrompt` which is defined later in this function.
+  // Migration: anyone still on the pre-search-launch default OR on the marker-based
+  // search default gets upgraded to the new tool-calling prompt. Custom prompts
+  // are left alone.
   useEffect(() => {
-    if (settings.systemPrompt === OLD_DEFAULT_PROMPT) {
-      setSettings((prev) => ({ ...prev, systemPrompt: NEW_DEFAULT_PROMPT }))
+    if (settings.systemPrompt === LEGACY_DEFAULT_PROMPT || settings.systemPrompt === LEGACY_MARKER_PROMPT) {
+      setSettings((prev) => ({ ...prev, systemPrompt: DEFAULT_PROMPT }))
     }
   }, [settings.systemPrompt, setSettings])
 
@@ -140,7 +153,7 @@ export function useChat() {
   }, [])
 
   const streamResponse = useCallback(
-    async (conversationMessages: { role: string; content: string | ContentPart[] }[]) => {
+    async (conversationMessages: { role: string; content: string | ContentPart[]; tool_calls?: ToolCall[] }[]) => {
       const controller = new AbortController()
       abortRef.current = controller
 
@@ -171,6 +184,40 @@ export function useChat() {
         await parseStream(
           reader,
           (chunk: StreamChunk) => {
+            if (chunk.type === "tool_calls_required") {
+              // Snapshot the in-progress assistant text/reasoning into a committed
+              // message so it stays visible. Hand off the tool calls to the
+              // search-and-re-query pipeline.
+              setState((prev) => {
+                const fullContent = prev.streamingContent
+                const outputTok = countTokens(fullContent) + 4
+                const elapsed = (Date.now() - streamStartRef.current) / 1000
+                const generationTimeMs = Date.now() - streamStartRef.current
+                const tokensPerSecond = elapsed > 0 ? Math.round((outputTok / elapsed) * 10) / 10 : 0
+                const interimAssistant: ChatMessage = {
+                  role: "assistant",
+                  content: fullContent,
+                  reasoning: prev.streamingReasoning || undefined,
+                  timestamp: Date.now(),
+                  tokensPerSecond,
+                  generationTimeMs,
+                  tool_calls: chunk.tool_calls,
+                }
+                return {
+                  ...prev,
+                  messages: [...prev.messages, interimAssistant],
+                  outputTokens: prev.outputTokens + outputTok,
+                  isStreaming: false,
+                  streamingContent: "",
+                  streamingReasoning: "",
+                  hasShownReasoning: false,
+                  didCommitInterim: true,
+                }
+              })
+              // Run asynchronously so the current chunk handler returns first.
+              setTimeout(() => processToolCallsAndRequery(conversationMessages, chunk.tool_calls), 0)
+              return
+            }
             if (chunk.type === "reasoning") {
               setState((prev) => ({
                 ...prev,
@@ -186,26 +233,20 @@ export function useChat() {
           },
           () => {
             setState((prev) => {
-              const fullContent = prev.streamingContent
-              const match = fullContent.match(SEARCH_RE)
-
-              if (match) {
-                // AI requested a web search — don't add marker as message.
-                // Keep abortRef.current alive so cancelStream() also aborts the search fetches.
-                const query = match[1]
-                // Trigger search cycle asynchronously
-                setTimeout(() => searchAndRequery(conversationMessages, query), 0)
+              // Tool_calls_required already committed the in-progress assistant;
+              // don't double-push. Just transition back to idle and stash sources
+              // so the next stream's final message can attach them.
+              if (prev.didCommitInterim) {
                 return {
                   ...prev,
-                  isSearching: true,
-                  searchContext: { query, sources: [] },
                   isStreaming: false,
                   streamingContent: "",
                   streamingReasoning: "",
                   hasShownReasoning: false,
+                  didCommitInterim: false,
                 }
               }
-
+              const fullContent = prev.streamingContent
               const outputTok = countTokens(fullContent) + 4
               const elapsed = (Date.now() - streamStartRef.current) / 1000
               const generationTimeMs = Date.now() - streamStartRef.current
@@ -217,6 +258,9 @@ export function useChat() {
                 timestamp: Date.now(),
                 tokensPerSecond,
                 generationTimeMs,
+                ...(prev.searchContext?.sources?.length
+                  ? { sources: prev.searchContext.sources }
+                  : {}),
               }
               return {
                 ...prev,
@@ -236,6 +280,8 @@ export function useChat() {
               isStreaming: false,
               streamingContent: "",
               streamingReasoning: "",
+              hasShownReasoning: false,
+              didCommitInterim: false,
               error: err.message,
             }))
             abortRef.current = null
@@ -244,31 +290,17 @@ export function useChat() {
         )
       } catch (err) {
         if ((err as Error).name === "AbortError") {
-          setState((prev) => {
-            const fullContent = prev.streamingContent
-            const outputTok = countTokens(fullContent) + 4
-            const elapsed = (Date.now() - streamStartRef.current) / 1000
-            const generationTimeMs = Date.now() - streamStartRef.current
-            const tokensPerSecond = elapsed > 0 && outputTok > 0 ? Math.round((outputTok / elapsed) * 10) / 10 : 0
-            const assistantMessage: ChatMessage = {
-              role: "assistant",
-              content: fullContent || "",
-              reasoning: prev.streamingReasoning || undefined,
-              timestamp: Date.now(),
-              ...(fullContent ? { tokensPerSecond, generationTimeMs } : {}),
-            }
-            return {
-              ...prev,
-              messages: fullContent ? [...prev.messages, assistantMessage] : prev.messages,
-              outputTokens: prev.outputTokens + (fullContent ? outputTok : 0),
-              isStreaming: false,
-              streamingContent: "",
-              streamingReasoning: "",
-            }
-          })
+          setState((prev) => ({
+            ...prev,
+            didCommitInterim: false,
+            isStreaming: false,
+            streamingContent: "",
+            streamingReasoning: "",
+          }))
         } else {
           setState((prev) => ({
             ...prev,
+            didCommitInterim: false,
             isStreaming: false,
             error: err instanceof Error ? err.message : "Request failed",
           }))
@@ -276,74 +308,104 @@ export function useChat() {
         abortRef.current = null
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- processToolCallsAndRequery is intentionally captured via closure; updating the dep list creates a circular memoization loop.
     [settings]
   )
 
-  const searchAndRequery = useCallback(
-    async (originalMessages: { role: string; content: string | ContentPart[] }[], query: string) => {
+  const processToolCallsAndRequery = useCallback(
+    async (
+      originalMessages: { role: string; content: string | ContentPart[]; tool_calls?: ToolCall[] }[],
+      toolCalls: ToolCall[]
+    ) => {
       // Reuse the stream's AbortController so cancelStream() also cancels these fetches.
       const signal = abortRef.current?.signal
+
+      const webSearches = toolCalls.filter((tc) => tc.function.name === "web_search")
+      const headLabel = webSearches[0] ? describeArgs(webSearches[0].function.arguments) : ""
+
+      // Surface a "Searching..." indicator using the first query we found.
+      if (headLabel) {
+        setState((prev) => ({
+          ...prev,
+          isSearching: true,
+          searchContext: { query: headLabel, sources: [] },
+        }))
+      } else {
+        setState((prev) => ({ ...prev, isSearching: true, searchContext: null }))
+      }
+
+      // Look up the search context for each tool call id (one per call).
+      const toolMessages: { role: "tool"; tool_call_id: string; content: string }[] = []
+      const allSources: string[] = []
+      const allQueries: string[] = []
+
       try {
-        const searchRes = await fetch("/api/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query, max_results: 5 }),
-          ...(signal ? { signal } : {}),
-        })
-        if (!searchRes.ok) {
-          throw new Error("Search failed")
-        }
-        const searchData = await searchRes.json()
-        const results: SearchResult[] = searchData.results || []
-
-        // Extract only the BEST-matching URL (DDG's top-ranked result).
-        const bestUrl = results[0]?.href
-        const parts: string[] = []
-
-        if (bestUrl) {
-          try {
-            const extRes = await fetch("/api/extract", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ url: bestUrl }),
-              ...(signal ? { signal } : {}),
+        for (const tc of toolCalls) {
+          if (tc.function.name !== "web_search") {
+            toolMessages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: `Tool "${tc.function.name}" is not supported in this environment.`,
             })
-            if (extRes.ok) {
-              const extData = await extRes.json()
-              if (extData.content) {
-                parts.push(`Source: ${bestUrl}\n${extData.content}`)
-                // Accumulate sources via prev state to fix the closure bug.
-                setState((prev) => ({
-                  ...prev,
-                  searchContext: {
-                    query,
-                    sources: [...(prev.searchContext?.sources || []), bestUrl],
-                  },
-                }))
-              }
-            }
+            continue
+          }
+
+          const args = parseArgs(tc.function.arguments)
+          const query = typeof args.query === "string" ? args.query.trim() : ""
+          if (!query) {
+            toolMessages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: "No query was provided to web_search.",
+            })
+            continue
+          }
+
+          allQueries.push(query)
+          // Update indicator to show the most recent query when multiple searches run.
+          setState((prev) => ({
+            ...prev,
+            searchContext: { query, sources: prev.searchContext?.sources ?? [] },
+          }))
+
+          try {
+            const text = await runWebSearch(query, signal)
+            toolMessages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: text.content,
+            })
+            // Sources accumulate so the final assistant message can cite them.
+            if (text.url) allSources.push(text.url)
+            setState((prev) => ({
+              ...prev,
+              searchContext: {
+                query,
+                sources: [...(prev.searchContext?.sources ?? []), ...(text.url ? [text.url] : [])],
+              },
+            }))
           } catch (e) {
-            // Rethrow aborts so the outer catch can handle them silently.
             if ((e as Error).name === "AbortError") throw e
+            toolMessages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: `Search failed: ${(e as Error).message}`,
+            })
           }
         }
 
-        const searchContext = parts.length > 0 ? parts.join("\n\n---\n\n") : null
-
-        // Build new conversation messages: pop last user message, re-add with separate context injection.
-        const popMsg = originalMessages.pop()
-
-        const newMessages = [
+        // Append assistant(tool_calls) + tool messages so the model sees its own
+        // request and the corresponding results in the next turn.
+        const newMessages: typeof originalMessages = [
           ...originalMessages,
-          ...(searchContext
-            ? [{ role: "user" as const, content: `[WEB SEARCH RESULT]\n${searchContext}` }]
+          ...(toolCalls.length > 0
+            ? [{ role: "assistant" as const, content: "", tool_calls: toolCalls }]
             : []),
-          ...(popMsg ? [popMsg] : []),
+          ...toolMessages,
         ]
 
-        // Honor an abort that landed in the microsecond window between search completion
-        // and streamResponse init (otherwise streamResponse would replace abortRef and the
-        // user's cancel intent would be lost).
+        // Honor an abort that landed in the microsecond window between search
+        // completion and streamResponse init (don't replace abortRef).
         if (signal?.aborted) {
           const e = new Error("aborted")
           ;(e as Error).name = "AbortError"
@@ -358,29 +420,36 @@ export function useChat() {
           streamingReasoning: "",
           hasShownReasoning: false,
           isSearching: false,
+          // Keep searchContext with sources so the next stream's onDone can attach them.
+          searchContext: prev.searchContext ?? { query: allQueries[0] ?? "", sources: allSources },
         }))
 
         await streamResponse(newMessages)
       } catch (err) {
         if ((err as Error)?.name === "AbortError") {
-          // Silent cancel: user pressed Stop mid-search. Don't show error banner.
           setState((prev) => ({
             ...prev,
             isSearching: false,
             searchContext: null,
             streamingContent: "",
             streamingReasoning: "",
+            didCommitInterim: false,
           }))
           return
         }
+        // Mirror the abort branch: don't leak didCommitInterim / searchContext when
+        // the search itself fails — otherwise the next sendMessage starts in a
+        // mixed state with stale sources.
         setState((prev) => ({
           ...prev,
           isSearching: false,
           searchContext: null,
+          streamingContent: "",
+          streamingReasoning: "",
+          didCommitInterim: false,
           error: err instanceof Error ? err.message : "Search & re-query failed",
         }))
       } finally {
-        // If this controller was aborted, clear the ref so future requests start clean.
         if (abortRef.current?.signal.aborted) {
           abortRef.current = null
         }
@@ -424,11 +493,14 @@ export function useChat() {
         error: null,
         isSearching: false,
         searchContext: null,
+        didCommitInterim: false,
       }))
 
       const conversationMessages = [...state.messages, userMessage].map((m) => ({
         role: m.role,
         content: m.content,
+        ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+        ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
       }))
 
       await streamResponse(conversationMessages)
@@ -469,11 +541,14 @@ export function useChat() {
         error: null,
         isSearching: false,
         searchContext: null,
+        didCommitInterim: false,
       }))
 
-      const conversationMessages = [...truncatedMessages, userMessage].map((m) => ({
+      const conversationMessages = truncatedMessages.concat(userMessage).map((m) => ({
         role: m.role,
         content: m.content,
+        ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+        ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
       }))
 
       await streamResponse(conversationMessages)
@@ -501,6 +576,7 @@ export function useChat() {
       error: null,
       isSearching: false,
       searchContext: null,
+      didCommitInterim: false,
     })
   }, [])
 
@@ -571,4 +647,69 @@ export function useChat() {
     setMaxTokens,
     setTopP,
   }
+}
+
+// ----- helpers (module-scoped, no closure state) -----
+
+/** Run a search + extract + synthesize tool result text. */
+async function runWebSearch(
+  query: string,
+  signal?: AbortSignal
+): Promise<{ content: string; url?: string }> {
+  const searchRes = await fetch("/api/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, max_results: 5 }),
+    ...(signal ? { signal } : {}),
+  })
+  if (!searchRes.ok) throw new Error("Search failed")
+  const searchData = await searchRes.json()
+  const results: SearchResult[] = searchData.results || []
+  const bestUrl = results[0]?.href
+
+  let pageContent = ""
+  if (bestUrl) {
+    const extRes = await fetch("/api/extract", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: bestUrl }),
+      ...(signal ? { signal } : {}),
+    })
+    if (extRes.ok) {
+      const extData = await extRes.json()
+      pageContent = typeof extData.content === "string" ? extData.content : ""
+    }
+  }
+
+  if (!bestUrl) {
+    return { content: `No web results found for: ${query}` }
+  }
+  if (!pageContent) {
+    return {
+      content: `Source: ${bestUrl}\n(Unable to extract page content. Summarize from the URL itself.)`,
+      url: bestUrl,
+    }
+  }
+  return {
+    content: `Source: ${bestUrl}\n${pageContent}`,
+    url: bestUrl,
+  }
+}
+
+/** Parse a streamed arguments JSON string; tolerate partial / malformed input. */
+function parseArgs(args: string | undefined): Record<string, unknown> {
+  if (!args) return {}
+  try {
+    const parsed = JSON.parse(args)
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** Format function arguments into a short label for the "Searching..." indicator. */
+function describeArgs(args: string | undefined): string {
+  const parsed = parseArgs(args)
+  const q = parsed.query
+  return typeof q === "string" ? q : ""
 }

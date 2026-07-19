@@ -1,9 +1,11 @@
-import { retryWithBackoff } from "@/lib/retry"
+import { ddgExtract, DDGUpstreamError } from "@/lib/ddg"
 
-// Same const as search/route.ts — copy this if you self-host DDGS.
-const DDGS_BASE = "https://ddgs.vercel.app"
-const EXTRACT_BUDGET_MS = 25_000 // shared budget across retries (per-attempt timeout = remaining)
-const EXTRACT_MAX_CHARS = 20_000
+const EXTRACT_FORMATS = ["text_markdown", "text_plain", "text_rich", "text", "content"] as const
+type ExtractFormat = (typeof EXTRACT_FORMATS)[number]
+
+function isExtractFormat(value: unknown): value is ExtractFormat {
+  return typeof value === "string" && (EXTRACT_FORMATS as readonly string[]).includes(value)
+}
 
 export async function POST(req: Request) {
   try {
@@ -24,41 +26,16 @@ export async function POST(req: Request) {
       return Response.json({ error: "Only http(s) URLs are allowed" }, { status: 400 })
     }
 
-    const format = ["text_markdown", "text_plain", "text_rich", "text", "content"].includes(
-      String(body?.format)
-    )
-      ? String(body.format)
-      : "text_markdown"
+    const format: ExtractFormat = isExtractFormat(body?.format) ? body.format : "text_markdown"
 
-    const deadline = Date.now() + EXTRACT_BUDGET_MS
-    const res = await retryWithBackoff(() => {
-      const remaining = Math.max(1000, deadline - Date.now())
-      return fetch(`${DDGS_BASE}/extract`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, format }),
-        signal: AbortSignal.timeout(remaining),
-      })
-    }, 2)
+    const content = await ddgExtract(url, { format })
 
-    if (res.status === 422) {
-      return Response.json({ error: "Extract upstream rejected the URL." }, { status: 502 })
-    }
-    if (res.status === 403) {
-      return Response.json({ error: "Extract blocked by upstream server." }, { status: 502 })
-    }
-    if (res.status === 429) {
-      return Response.json({ error: "Extract rate-limited. Please try again shortly." }, { status: 429 })
-    }
-    if (!res.ok) {
-      return Response.json({ error: `Extract upstream failed (${res.status}).` }, { status: 502 })
-    }
-
-    const data = await res.json().catch(() => ({}))
-    const content = typeof data?.content === "string" ? data.content : ""
-
-    return Response.json({ url, content: content.slice(0, EXTRACT_MAX_CHARS) })
+    return Response.json({ url, content })
   } catch (err: unknown) {
+    if (err instanceof DDGUpstreamError) {
+      const status = err.status === 429 ? 429 : 502
+      return Response.json({ error: err.message }, { status })
+    }
     const msg = err instanceof Error ? err.message : "Extraction failed"
     return Response.json({ error: msg }, { status: 500 })
   }

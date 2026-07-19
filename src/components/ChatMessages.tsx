@@ -56,7 +56,7 @@ export function ChatMessages({ messages, isStreaming, streamingContent, streamin
         </div>
       )}
 
-      {messages.map((msg, i) => (
+      {messages.filter((m) => m.role !== "tool").map((msg, i) => (
         <ChatMessage
           key={i}
           role={msg.role}
@@ -64,6 +64,7 @@ export function ChatMessages({ messages, isStreaming, streamingContent, streamin
           reasoning={msg.reasoning}
           tokensPerSecond={msg.tokensPerSecond}
           generationTimeMs={msg.generationTimeMs}
+          sources={msg.sources}
           isStreaming={false}
           isLatest={false}
           onEdit={onEditMessage ? (newContent) => onEditMessage(i, newContent) : undefined}

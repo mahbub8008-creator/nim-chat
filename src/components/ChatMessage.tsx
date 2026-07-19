@@ -19,7 +19,6 @@ interface Props {
   tokensPerSecond?: number
   generationTimeMs?: number
   liveElapsedMs?: number
-  sources?: string[]
   onEdit?: (newContent: string) => void
 }
 
@@ -48,15 +47,7 @@ function formatTokensPerSecond(tps: number): string {
   return `${tps.toFixed(1)} t/s`
 }
 
-function getHostname(url: string): string {
-  try {
-    return new URL(url).hostname.replace(/^www\./, "")
-  } catch {
-    return url
-  }
-}
-
-export function ChatMessage({ role, content, reasoning, isStreaming, isLatest, tokensPerSecond, generationTimeMs, liveElapsedMs, sources, onEdit }: Props) {
+export function ChatMessage({ role, content, reasoning, isStreaming, isLatest, tokensPerSecond, generationTimeMs, liveElapsedMs, onEdit }: Props) {
   const [editing, setEditing] = useState(false)
   const hasContentImages = imageCount(content) > 0
   const displayText = getContentText(content)
@@ -336,32 +327,6 @@ export function ChatMessage({ role, content, reasoning, isStreaming, isLatest, t
           </div>
         )}
 
-        {/* Source links the AI consulted (web search turn) */}
-        {!isUser && sources && sources.length > 0 && (
-          <div className="mt-3 flex flex-wrap items-center gap-1.5">
-            <span className="inline-flex items-center gap-1 rounded-md bg-zinc-800/60 px-2 py-0.5 text-xs text-zinc-500">
-              <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 015.656 0l1.415 1.415a4 4 0 010 5.656l-3 3a4 4 0 01-5.656 0M10.172 13.828a4 4 0 01-5.656 0l-1.415-1.415a4 4 0 010-5.656l3-3a4 4 0 015.656 0" />
-              </svg>
-              Sources
-            </span>
-            {sources.map((url, i) => (
-              <a
-                key={`${url}-${i}`}
-                href={url}
-                target="_blank"
-                rel="noopener noreferrer"
-                title={url}
-                className="inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-800/40 px-2 py-0.5 text-xs text-emerald-400 hover:border-emerald-600 hover:bg-zinc-800 hover:text-emerald-300 transition-colors"
-              >
-                <svg className="h-3 w-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                </svg>
-                <span className="max-w-[180px] truncate">{getHostname(url)}</span>
-              </a>
-            ))}
-          </div>
-        )}
       </div>
     </div>
   )

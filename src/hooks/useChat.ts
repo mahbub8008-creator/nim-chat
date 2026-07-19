@@ -243,9 +243,6 @@ export function useChat() {
                   timestamp: Date.now(),
                   tokensPerSecond,
                   generationTimeMs,
-                  ...(prev.searchContext?.sources?.length
-                    ? { sources: prev.searchContext.sources }
-                    : {}),
                 }
                 return {
                   ...prev,
@@ -672,12 +669,15 @@ async function runWebSearch(
   }
   if (!pageContent) {
     return {
-      content: `Source: ${bestUrl}\n(Unable to extract page content. Summarize from the URL itself.)`,
+      content: `(Unable to extract page content from the search result.)`,
       url: bestUrl,
     }
   }
+  // Strip the URL prefix from the synthesized tool message so the model can't
+  // echo a source URL into its reply. The page content goes through as-is;
+  // `url` is still returned internally so we can label the search spinner.
   return {
-    content: `Source: ${bestUrl}\n${pageContent}`,
+    content: pageContent,
     url: bestUrl,
   }
 }

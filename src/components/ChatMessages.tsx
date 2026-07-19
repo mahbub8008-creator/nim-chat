@@ -64,7 +64,6 @@ export function ChatMessages({ messages, isStreaming, streamingContent, streamin
           reasoning={msg.reasoning}
           tokensPerSecond={msg.tokensPerSecond}
           generationTimeMs={msg.generationTimeMs}
-          sources={msg.sources}
           isStreaming={false}
           isLatest={false}
           onEdit={onEditMessage ? (newContent) => onEditMessage(i, newContent) : undefined}

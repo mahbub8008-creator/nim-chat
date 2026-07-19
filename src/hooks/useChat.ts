@@ -223,39 +223,51 @@ export function useChat() {
                 ...prev,
                 streamingContent: prev.streamingContent + chunk.text,
               }))
+            } else if (chunk.type === "done") {
+              // Commit the cumulated streaming content as the *final* assistant
+              // message for this conversation turn. The chat route emits `done`
+              // only when finish_reason !== 'tool_calls', so this fires exactly
+              // once — after all tool turns are complete — never after
+              // tool_calls_required. parseStream's onDone will also fire when the
+              // SSE EOFs but only does cleanup below.
+              setState((prev) => {
+                const fullContent = prev.streamingContent
+                const outputTok = countTokens(fullContent) + 4
+                const elapsed = (Date.now() - streamStartRef.current) / 1000
+                const generationTimeMs = Date.now() - streamStartRef.current
+                const tokensPerSecond = elapsed > 0 ? Math.round((outputTok / elapsed) * 10) / 10 : 0
+                const assistantMessage: ChatMessage = {
+                  role: "assistant",
+                  content: fullContent,
+                  reasoning: prev.streamingReasoning || undefined,
+                  timestamp: Date.now(),
+                  tokensPerSecond,
+                  generationTimeMs,
+                  ...(prev.searchContext?.sources?.length
+                    ? { sources: prev.searchContext.sources }
+                    : {}),
+                }
+                return {
+                  ...prev,
+                  messages: [...prev.messages, assistantMessage],
+                  outputTokens: prev.outputTokens + outputTok,
+                  isStreaming: false,
+                  streamingContent: "",
+                  streamingReasoning: "",
+                  hasShownReasoning: false,
+                  searchContext: null,
+                }
+              })
+              abortRef.current = null
             }
           },
           () => {
-            setState((prev) => {
-              const fullContent = prev.streamingContent
-              const outputTok = countTokens(fullContent) + 4
-              const elapsed = (Date.now() - streamStartRef.current) / 1000
-              const generationTimeMs = Date.now() - streamStartRef.current
-              const tokensPerSecond = elapsed > 0 ? Math.round((outputTok / elapsed) * 10) / 10 : 0
-              const assistantMessage: ChatMessage = {
-                role: "assistant",
-                content: fullContent,
-                reasoning: prev.streamingReasoning || undefined,
-                timestamp: Date.now(),
-                tokensPerSecond,
-                generationTimeMs,
-                ...(prev.searchContext?.sources?.length
-                  ? { sources: prev.searchContext.sources }
-                  : {}),
-              }
-              return {
-                ...prev,
-                messages: [...prev.messages, assistantMessage],
-                outputTokens: prev.outputTokens + outputTok,
-                isStreaming: false,
-                streamingContent: "",
-                streamingReasoning: "",
-                hasShownReasoning: false,
-                // Detach searchContext from this turn so stale sources from a prior
-                // web_search don't bleed onto the next assistant message.
-                searchContext: null,
-              }
-            })
+            // SSE closed without an explicit `done` chunk — happens after
+            // tool_calls_required (the chat route closes the connection there
+            // without sending `done`) or on abrupt stream aborts. The actual
+            // final commit happened on the `done` chunk handler above (only
+            // fires when finish_reason !== 'tool_calls'). Here we only clean up
+            // the abort-controller reference.
             abortRef.current = null
           },
           (err: Error) => {

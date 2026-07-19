@@ -33,9 +33,6 @@ interface ChatState {
   error: string | null
   isSearching: boolean
   searchContext: { query: string; sources: string[] } | null
-  /** Set when tool_calls_required committed an interim assistant message early;
-   *  parseStream's onDone must then skip appending to messages. */
-  didCommitInterim: boolean
 }
 
 // ----- Legacy prompts we want to migrate users off of -----
@@ -103,7 +100,6 @@ export function useChat() {
               error: null,
               isSearching: false,
               searchContext: null,
-              didCommitInterim: false,
             }
           }
         }
@@ -120,7 +116,6 @@ export function useChat() {
       error: null,
       isSearching: false,
       searchContext: null,
-      didCommitInterim: false,
     }
   })
 
@@ -147,10 +142,6 @@ export function useChat() {
       setSettings((prev) => ({ ...prev, systemPrompt: DEFAULT_PROMPT }))
     }
   }, [settings.systemPrompt, setSettings])
-
-  const update = useCallback((partial: Partial<ChatState>) => {
-    setState((prev) => ({ ...prev, ...partial }))
-  }, [])
 
   const streamResponse = useCallback(
     async (conversationMessages: { role: string; content: string | ContentPart[]; tool_calls?: ToolCall[] }[]) => {
@@ -185,37 +176,40 @@ export function useChat() {
           reader,
           (chunk: StreamChunk) => {
             if (chunk.type === "tool_calls_required") {
-              // Snapshot the in-progress assistant text/reasoning into a committed
-              // message so it stays visible. Hand off the tool calls to the
-              // search-and-re-query pipeline.
+              // Show "Searching..." spinner and hand off to the search pipeline.
+              // Crucially we DO NOT commit an interim assistant message: the live
+              // bubble stays visible with whatever the model streamed so far, and
+              // turn 2's content appends to the same bubble via streamingContent —
+              // yielding ONE coherent response per user turn.
+              //
+              // Snapshot captured into a module-scope var via the setState callback
+              // so the value is current by the time processToolCallsAndRequery runs.
+              // (streamingReasoning doesn't need its own snapshot — it stays in
+              // state across both turns and accumulates naturally.)
+              let snapshotContent = ""
+              const firstWebSearch = chunk.tool_calls.find(
+                (tc) => tc.function.name === "web_search"
+              )
+              const headLabel = firstWebSearch
+                ? describeArgs(firstWebSearch.function.arguments)
+                : "web search"
               setState((prev) => {
-                const fullContent = prev.streamingContent
-                const outputTok = countTokens(fullContent) + 4
-                const elapsed = (Date.now() - streamStartRef.current) / 1000
-                const generationTimeMs = Date.now() - streamStartRef.current
-                const tokensPerSecond = elapsed > 0 ? Math.round((outputTok / elapsed) * 10) / 10 : 0
-                const interimAssistant: ChatMessage = {
-                  role: "assistant",
-                  content: fullContent,
-                  reasoning: prev.streamingReasoning || undefined,
-                  timestamp: Date.now(),
-                  tokensPerSecond,
-                  generationTimeMs,
-                  tool_calls: chunk.tool_calls,
-                }
+                snapshotContent = prev.streamingContent
                 return {
                   ...prev,
-                  messages: [...prev.messages, interimAssistant],
-                  outputTokens: prev.outputTokens + outputTok,
-                  isStreaming: false,
-                  streamingContent: "",
-                  streamingReasoning: "",
-                  hasShownReasoning: false,
-                  didCommitInterim: true,
+                  isSearching: true,
+                  searchContext: { query: headLabel, sources: [] },
                 }
               })
-              // Run asynchronously so the current chunk handler returns first.
-              setTimeout(() => processToolCallsAndRequery(conversationMessages, chunk.tool_calls), 0)
+              setTimeout(
+                () =>
+                  processToolCallsAndRequery(
+                    conversationMessages,
+                    chunk.tool_calls,
+                    snapshotContent
+                  ),
+                0
+              )
               return
             }
             if (chunk.type === "reasoning") {
@@ -233,19 +227,6 @@ export function useChat() {
           },
           () => {
             setState((prev) => {
-              // Tool_calls_required already committed the in-progress assistant;
-              // don't double-push. Just transition back to idle and stash sources
-              // so the next stream's final message can attach them.
-              if (prev.didCommitInterim) {
-                return {
-                  ...prev,
-                  isStreaming: false,
-                  streamingContent: "",
-                  streamingReasoning: "",
-                  hasShownReasoning: false,
-                  didCommitInterim: false,
-                }
-              }
               const fullContent = prev.streamingContent
               const outputTok = countTokens(fullContent) + 4
               const elapsed = (Date.now() - streamStartRef.current) / 1000
@@ -270,6 +251,9 @@ export function useChat() {
                 streamingContent: "",
                 streamingReasoning: "",
                 hasShownReasoning: false,
+                // Detach searchContext from this turn so stale sources from a prior
+                // web_search don't bleed onto the next assistant message.
+                searchContext: null,
               }
             })
             abortRef.current = null
@@ -281,8 +265,10 @@ export function useChat() {
               streamingContent: "",
               streamingReasoning: "",
               hasShownReasoning: false,
-              didCommitInterim: false,
               error: err.message,
+              // Detach searchContext so stale sources from a prior search don't
+              // bleed onto the next assistant message.
+              searchContext: null,
             }))
             abortRef.current = null
           },
@@ -292,49 +278,40 @@ export function useChat() {
         if ((err as Error).name === "AbortError") {
           setState((prev) => ({
             ...prev,
-            didCommitInterim: false,
             isStreaming: false,
             streamingContent: "",
             streamingReasoning: "",
+            // Detach any leftover search context from a tool turn that got cancelled.
+            searchContext: null,
           }))
         } else {
           setState((prev) => ({
             ...prev,
-            didCommitInterim: false,
             isStreaming: false,
             error: err instanceof Error ? err.message : "Request failed",
+            // Detach so a failed tool turn doesn't pollute the next assistant message.
+            searchContext: null,
           }))
         }
         abortRef.current = null
       }
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- processToolCallsAndRequery is intentionally captured via closure; updating the dep list creates a circular memoization loop.
+    // processToolCallsAndRequery is intentionally captured via closure; updating the
+    // dep list creates a circular memoization loop (it depends on streamResponse, which
+    // depends on this closure to set up the re-prompt).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [settings]
   )
 
   const processToolCallsAndRequery = useCallback(
     async (
       originalMessages: { role: string; content: string | ContentPart[]; tool_calls?: ToolCall[] }[],
-      toolCalls: ToolCall[]
+      toolCalls: ToolCall[],
+      partialContent: string
     ) => {
       // Reuse the stream's AbortController so cancelStream() also cancels these fetches.
       const signal = abortRef.current?.signal
 
-      const webSearches = toolCalls.filter((tc) => tc.function.name === "web_search")
-      const headLabel = webSearches[0] ? describeArgs(webSearches[0].function.arguments) : ""
-
-      // Surface a "Searching..." indicator using the first query we found.
-      if (headLabel) {
-        setState((prev) => ({
-          ...prev,
-          isSearching: true,
-          searchContext: { query: headLabel, sources: [] },
-        }))
-      } else {
-        setState((prev) => ({ ...prev, isSearching: true, searchContext: null }))
-      }
-
-      // Look up the search context for each tool call id (one per call).
       const toolMessages: { role: "tool"; tool_call_id: string; content: string }[] = []
       const allSources: string[] = []
       const allQueries: string[] = []
@@ -394,13 +371,17 @@ export function useChat() {
           }
         }
 
-        // Append assistant(tool_calls) + tool messages so the model sees its own
-        // request and the corresponding results in the next turn.
+        // Synthesize an assistant(tool_calls) message + the tool results so the model
+        // sees its own prior turn. We DO NOT commit this synthesized message to
+        // state.messages — the live bubble keeps showing partialContent and turn 2's
+        // tokens append via streamingContent, yielding ONE bubble per user turn.
         const newMessages: typeof originalMessages = [
           ...originalMessages,
-          ...(toolCalls.length > 0
-            ? [{ role: "assistant" as const, content: "", tool_calls: toolCalls }]
-            : []),
+          {
+            role: "assistant" as const,
+            content: partialContent,
+            tool_calls: toolCalls,
+          },
           ...toolMessages,
         ]
 
@@ -416,11 +397,10 @@ export function useChat() {
         setState((prev) => ({
           ...prev,
           isStreaming: true,
-          streamingContent: "",
-          streamingReasoning: "",
-          hasShownReasoning: false,
+          // KEEP streamingContent / streamingReasoning — they're the first half of
+          // the single visible bubble. They keep growing while turn 2 streams.
           isSearching: false,
-          // Keep searchContext with sources so the next stream's onDone can attach them.
+          // Keep searchContext with sources so the final onDone can attach them.
           searchContext: prev.searchContext ?? { query: allQueries[0] ?? "", sources: allSources },
         }))
 
@@ -429,24 +409,21 @@ export function useChat() {
         if ((err as Error)?.name === "AbortError") {
           setState((prev) => ({
             ...prev,
+            isStreaming: false,
             isSearching: false,
             searchContext: null,
             streamingContent: "",
             streamingReasoning: "",
-            didCommitInterim: false,
           }))
           return
         }
-        // Mirror the abort branch: don't leak didCommitInterim / searchContext when
-        // the search itself fails — otherwise the next sendMessage starts in a
-        // mixed state with stale sources.
         setState((prev) => ({
           ...prev,
+          isStreaming: false,
           isSearching: false,
           searchContext: null,
           streamingContent: "",
           streamingReasoning: "",
-          didCommitInterim: false,
           error: err instanceof Error ? err.message : "Search & re-query failed",
         }))
       } finally {
@@ -493,7 +470,6 @@ export function useChat() {
         error: null,
         isSearching: false,
         searchContext: null,
-        didCommitInterim: false,
       }))
 
       const conversationMessages = [...state.messages, userMessage].map((m) => ({
@@ -541,7 +517,6 @@ export function useChat() {
         error: null,
         isSearching: false,
         searchContext: null,
-        didCommitInterim: false,
       }))
 
       const conversationMessages = truncatedMessages.concat(userMessage).map((m) => ({
@@ -576,7 +551,6 @@ export function useChat() {
       error: null,
       isSearching: false,
       searchContext: null,
-      didCommitInterim: false,
     })
   }, [])
 

@@ -191,6 +191,18 @@ export async function POST(req: Request) {
       if (status >= 500) {
         return Response.json({ error: `Server error (${status}). Please try again.` }, { status })
       }
+      // Map 4xx content-type rejections on image payloads to a friendly hint.
+      // NIM/OpenAI typically phrases vision-model mismatches with one of these tokens.
+      if (status >= 400) {
+        const lowerMessage = message.toLowerCase()
+        const visionTokens = ["image", "vision", "multimodal", "image_url", "content type", "unsupported", "vlm"]
+        if (visionTokens.some((token) => lowerMessage.includes(token))) {
+          return Response.json(
+            { error: "This model does not accept image inputs \u2014 switch to a vision-capable model from the dropdown (look for the \ud83d\udcf7 icon)." },
+            { status }
+          )
+        }
+      }
     }
 
     return Response.json({ error: message }, { status: 500 })

@@ -64,6 +64,11 @@ export function isVisionModel(modelId: string): boolean {
     "qwen2-vl",
     "qwen2.5-vl",
     "qwen3-vl",
+    // Thinking Machines: Inkling is a multimodal MoE (text + image + audio).
+    // The name doesn't contain any vision keyword, so it must be listed explicitly.
+    "inkling",
+    // NVIDIA Cosmos: Cosmos-Reason and Cosmos-3 models are vision-capable.
+    "cosmos",
   ]
 
   // Check keywords first

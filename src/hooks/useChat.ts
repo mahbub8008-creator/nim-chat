@@ -5,7 +5,7 @@ import type { ChatMessage, ContentPart, StreamChunk, SearchResult, ToolCall } fr
 import { countTokens, getContentText } from "@/lib/tokens"
 import { parseStream } from "@/lib/stream"
 import { useLocalStorage } from "./useLocalStorage"
-import { CONVERSATION_KEY, SETTINGS_KEY, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TOP_P, isVisionModel } from "@/lib/constants"
+import { CONVERSATION_KEY, SETTINGS_KEY, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TOP_P } from "@/lib/constants"
 
 interface SavedConversation {
   messages: ChatMessage[]
@@ -448,17 +448,6 @@ export function useChat() {
   const sendMessage = useCallback(
     async (text: string, images?: string[]) => {
       const hasImages = !!(images && images.length > 0)
-
-      // Defense-in-depth: if user has the upload button enabled for a model we
-      // don't recognize as vision-capable, surface a clear error rather than
-      // burning a turn that the model will silently treat as text-only.
-      if (hasImages && !isVisionModel(settings.model)) {
-        setState((prev) => ({
-          ...prev,
-          error: "This model does not accept image inputs — switch to a vision-capable model (look for the \ud83d\udcf7 icon in the dropdown).",
-        }))
-        return
-      }
 
       let content: string | ContentPart[]
       if (hasImages) {

@@ -5,7 +5,7 @@ import type { ChatMessage, ContentPart, StreamChunk, SearchResult, ToolCall } fr
 import { countTokens, getContentText } from "@/lib/tokens"
 import { parseStream } from "@/lib/stream"
 import { useLocalStorage } from "./useLocalStorage"
-import { CONVERSATION_KEY, SETTINGS_KEY, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TOP_P } from "@/lib/constants"
+import { CONVERSATION_KEY, SETTINGS_KEY, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TOP_P, isVisionModel } from "@/lib/constants"
 
 interface SavedConversation {
   messages: ChatMessage[]
@@ -58,8 +58,8 @@ Assistant: [SEARCH: 2024 Super Bowl winner]
 User: Explain how gravity works.
 Assistant: Gravity is a fundamental interaction...`
 
-// ----- Current default: native tool calling -----
-const DEFAULT_PROMPT = `You are a helpful, knowledgeable assistant. You have access to a \`web_search\` function that fetches current information from the web and returns page excerpts. Use it whenever the user might benefit from up-to-date data and your training-cutoff knowledge would be unreliable or stale.
+// ----- Current default: native tool calling + vision -----
+const DEFAULT_PROMPT = `You are a helpful, knowledgeable assistant. You can analyze any images the user attaches to their message — look at them and answer based on what you see before doing anything else. You also have access to a \`web_search\` function that fetches current information from the web and returns page excerpts.
 
 USE \`web_search\` for:
 - Recent events, news, sports scores, product releases, prices, or anything time-sensitive.
@@ -67,6 +67,7 @@ USE \`web_search\` for:
 - Anything that may have changed since your training cutoff.
 
 DO NOT use \`web_search\` for:
+- Questions about an attached image (answer from the image).
 - Casual chat, opinions, creative writing, math, coding help, or general well-known concepts.
 - Anything you are already confident about.
 
@@ -447,6 +448,17 @@ export function useChat() {
   const sendMessage = useCallback(
     async (text: string, images?: string[]) => {
       const hasImages = !!(images && images.length > 0)
+
+      // Defense-in-depth: if user has the upload button enabled for a model we
+      // don't recognize as vision-capable, surface a clear error rather than
+      // burning a turn that the model will silently treat as text-only.
+      if (hasImages && !isVisionModel(settings.model)) {
+        setState((prev) => ({
+          ...prev,
+          error: "This model does not accept image inputs — switch to a vision-capable model (look for the \ud83d\udcf7 icon in the dropdown).",
+        }))
+        return
+      }
 
       let content: string | ContentPart[]
       if (hasImages) {

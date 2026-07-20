@@ -11,6 +11,9 @@ interface Props {
 
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024 // 20MB
 const ACCEPTED_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+// HEIC/HEIF files are common on iPhones but are not supported by most browsers
+// or vision APIs. We detect them explicitly so we can show a helpful message.
+const KNOWN_UNSUPPORTED_TYPES = ["image/heic", "image/heif"]
 const MAX_IMAGES = 10
 
 function readFileAsDataURL(file: File): Promise<string> {
@@ -78,7 +81,7 @@ export function ChatInput({ onSend, onCancel, isStreaming, disabled }: Props) {
 
     if (files.length === 0) return
 
-    // Validate count
+    // Validate count before doing any work.
     if (images.length + files.length > MAX_IMAGES) {
       setImageError(`Maximum ${MAX_IMAGES} images allowed`)
       return
@@ -89,11 +92,21 @@ export function ChatInput({ onSend, onCancel, isStreaming, disabled }: Props) {
     const oversized = files.filter((f) => f.size > MAX_IMAGE_SIZE)
     const validFiles = files.filter((f) => ACCEPTED_TYPES.includes(f.type) && f.size <= MAX_IMAGE_SIZE)
 
+    const errors: string[] = []
     if (invalidTypes.length > 0) {
-      setImageError(`Unsupported file type. Accepted: JPEG, PNG, GIF, WebP`)
+      const hasHeic = invalidTypes.some((f) => KNOWN_UNSUPPORTED_TYPES.includes(f.type))
+      if (hasHeic) {
+        errors.push("HEIC/HEIF images are not supported. Please convert to JPEG or PNG first.")
+      } else {
+        errors.push("Unsupported file type. Accepted: JPEG, PNG, GIF, WebP")
+      }
     }
     if (oversized.length > 0) {
-      setImageError(`Image too large. Maximum size: 20MB`)
+      errors.push(`Image too large. Maximum size: 20MB`)
+    }
+
+    if (errors.length > 0) {
+      setImageError(errors.join(" "))
     }
 
     if (validFiles.length === 0) return
@@ -226,20 +239,20 @@ export function ChatInput({ onSend, onCancel, isStreaming, disabled }: Props) {
           onClick={() => fileInputRef.current?.click()}
           disabled={isStreaming || disabled || images.length >= MAX_IMAGES}
           className="flex-shrink-0 rounded-lg p-2.5 text-zinc-500 hover:text-emerald-400 hover:bg-zinc-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-          title="Upload image"
+          title="Upload image (JPEG, PNG, GIF, WebP)"
         >
           <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.41a2.25 2.25 0 013.182 0l2.909 2.91m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
           </svg>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept={ACCEPTED_TYPES.join(",")}
-            multiple
-            className="hidden"
-            onChange={handleImageSelect}
-          />
         </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={ACCEPTED_TYPES.join(",")}
+          multiple
+          className="hidden"
+          onChange={handleImageSelect}
+        />
 
         {/* Text area */}
         <div className="flex-1 relative">

@@ -51,6 +51,19 @@ export function isVisionModel(modelId: string): boolean {
     "nvclip",
     "nemoretriever",
     "gemma-3",
+    // Mistral family: Mistral Large 3/3.x is multimodal; Pixtral is Mistral's
+    // vision line. Recognize both so the 📷 icon shows up next to these
+    // models in the dropdown.
+    "pixtral",
+    "mistral-large-3",
+    "mistral-3",
+    "magistral",
+    // Qwen family: only the VL (Vision-Language) variants are multimodal.
+    // Generic "qwen" models are text-only, so we match the explicit VL lines.
+    "qwen-vl",
+    "qwen2-vl",
+    "qwen2.5-vl",
+    "qwen3-vl",
   ]
 
   // Check keywords first

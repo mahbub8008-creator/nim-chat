@@ -71,13 +71,30 @@ export async function POST(req: Request) {
 
     const client = getClient()
 
+    // Detect whether the LATEST user message carries image content. Many NIM
+    // vision models silently ignore image_url parts when `tools` is also present
+    // in the request — they enter tool-calling mode and treat the turn as
+    // text-only. To avoid the "I don't see an image" failure, we omit the tools
+    // parameter entirely on image-bearing turns. Web search is rarely useful
+    // for image questions anyway (the system prompt says to answer from the
+    // image rather than searching), so this trade-off is safe.
+    //
+    // IMPORTANT: we check only the most recent user message, NOT all messages.
+    // Images in prior turns should NOT disable web search for later text-only
+    // follow-up questions.
+    const lastUserMsg = [...fullMessages].reverse().find((m) => m.role === "user")
+    const hasImageContent =
+      !!lastUserMsg &&
+      Array.isArray(lastUserMsg.content) &&
+      lastUserMsg.content.some((p) => (p as { type?: string }).type === "image_url")
+
     const stream = await retryWithBackoff(
       () =>
         client.chat.completions.create({
           model,
           messages: fullMessages,
           stream: true,
-          tools: TOOLS,
+          ...(hasImageContent ? {} : { tools: TOOLS }),
           temperature: temperature ?? 0.7,
           max_tokens: max_tokens ?? 4096,
           top_p: top_p ?? 1,
